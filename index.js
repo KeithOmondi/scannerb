@@ -13,100 +13,123 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
-// ================== Multer Config ===================
+// === Multer Configuration ===
+const uploadDir = path.join(__dirname, "uploads");
+if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
+
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, "uploads/"),
+  destination: (req, file, cb) => cb(null, uploadDir),
   filename: (req, file, cb) => cb(null, `${Date.now()}-${file.originalname}`),
 });
 const upload = multer({ storage });
 
-// ================== Helper: Normalize Name ===================
+// === Normalize Helper ===
 const normalize = (str) => {
   if (!str || typeof str !== "string") return "";
   return str
     .toLowerCase()
-    .replace(/alias.*$/g, "")   // remove alias
-    .replace(/\s+/g, " ")       // normalize spaces
+    .replace(/alias.*$/g, "")
+    .replace(/\s+/g, " ")
     .trim();
 };
 
-// ================== Match Endpoint ===================
-app.post("/match", upload.fields([{ name: "excel" }, { name: "pdf" }]), async (req, res) => {
-  try {
-    const threshold = parseInt(req.query.threshold) || 100;
-    const excelFile = req.files["excel"][0];
-    const pdfFile = req.files["pdf"][0];
+// === Core Route ===
 
-    // === Step 1: Read Excel ===
+app.post("/match", upload.fields([{ name: "excel" }, { name: "pdf" }]), async (req, res, next) => {
+  const cleanup = () => {
+    try {
+      if (req.files?.excel?.[0]?.path) fs.unlinkSync(req.files.excel[0].path);
+      if (req.files?.pdf?.[0]?.path) fs.unlinkSync(req.files.pdf[0].path);
+    } catch (err) {
+      console.error("⚠️ File cleanup failed:", err);
+    }
+  };
+
+  try {
+    console.log("📥 Received upload");
+    const threshold = parseInt(req.query.threshold) || 100;
+
+    const excelFile = req.files?.excel?.[0];
+    const pdfFile = req.files?.pdf?.[0];
+
+    if (!excelFile || !pdfFile) {
+      console.log("❌ Missing files");
+      return res.status(400).json({ error: "Both Excel and PDF files are required." });
+    }
+
+    // === Read Excel File ===
     const workbook = xlsx.readFile(excelFile.path);
     const sheet = workbook.Sheets[workbook.SheetNames[0]];
     const excelData = xlsx.utils.sheet_to_json(sheet);
     const excelNames = excelData
       .map(row => normalize(row["Name of The Deceased"]))
       .filter(Boolean);
+    console.log("✅ Excel names:", excelNames.length);
 
-    // === Step 2: Read and Parse PDF ===
+    if (!excelNames.length) {
+      cleanup();
+      return res.status(400).json({ error: "Excel sheet is empty or missing name column." });
+    }
+
+    // === Read PDF File ===
     const pdfBuffer = fs.readFileSync(pdfFile.path);
-    const pdfData = await pdfParse(pdfBuffer);
-    const text = pdfData.text;
+    const pdfText = (await pdfParse(pdfBuffer)).text;
+    console.log("✅ PDF text length:", pdfText.length);
 
-    // === Step 3: Extract Names from PDF ===
+    // === Extract Names from PDF ===
     const matches = new Set();
 
-    // Pattern 1: Estate phrases
     const estateRegex = /(to the estate of|estate of|re:|for|by)\s+(.*?)(?:,|\n| who died| deceased)/gi;
     let match;
-    while ((match = estateRegex.exec(text)) !== null) {
+    while ((match = estateRegex.exec(pdfText)) !== null) {
       matches.add(normalize(match[2]));
     }
 
-    // Pattern 2: General capitalized names (fallback)
-    const namePattern = /\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b/g;
-    const capitalizedNames = Array.from(text.matchAll(namePattern)).map(m => normalize(m[1]));
-    capitalizedNames.forEach(name => matches.add(name));
-
-    const pdfNames = Array.from(matches);
-
-    // === Step 4: Parallel Match Logic ===
-    const results = await Promise.all(
-      excelNames.map(async (excelName) => {
-        let bestMatch = { score: 0, gazetteMatch: "" };
-
-        for (const gazetteName of pdfNames) {
-          const score = fuzzball.ratio(excelName, gazetteName);
-          if (score > bestMatch.score) {
-            bestMatch = { score, gazetteMatch: gazetteName };
-          }
-        }
-
-        if (bestMatch.score >= threshold) {
-          return {
-            excelName,
-            gazetteMatch: bestMatch.gazetteMatch,
-            score: bestMatch.score,
-          };
-        }
-
-        return null;
-      })
+    const fallbackRegex = /\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b/g;
+    Array.from(pdfText.matchAll(fallbackRegex)).forEach(m =>
+      matches.add(normalize(m[1]))
     );
 
-    const finalResults = results.filter(r => r !== null);
+    const gazetteNames = Array.from(matches);
+    console.log("✅ Gazette names extracted:", gazetteNames.length);
 
-    // === Step 5: Clean Uploaded Files ===
-    fs.unlinkSync(excelFile.path);
-    fs.unlinkSync(pdfFile.path);
+    // === Efficient Batch Matching Using `fuzzball.extract()` ===
+    const results = excelNames.map(excelName => {
+      const topMatch = fuzzball.extract(excelName, gazetteNames, {
+        scorer: fuzzball.ratio,
+        returnObjects: true,
+        limit: 1,
+      })[0];
 
-    // === Step 6: Return Response ===
-    res.json({ matched: finalResults });
+      return {
+        excelName,
+        gazetteMatch: topMatch.string,
+        score: topMatch.score,
+      };
+    }).filter(result => result.score >= threshold);
 
-  } catch (error) {
-    console.error("❌ Error processing files:", error);
-    res.status(500).json({ error: "Failed to process files." });
+    console.log("✅ Matching complete:", results.length, "matches found");
+    cleanup();
+    return res.status(200).json({ matched: results });
+
+  } catch (err) {
+    console.error("❌ Error during processing:", err);
+    cleanup();
+    next(err);
   }
 });
 
-// ================== Start Server ===================
-app.listen(PORT, () => {
-  console.log(`✅ Server running on http://localhost:${PORT}`);
+
+
+// === Error Handler Middleware ===
+app.use((err, req, res, next) => {
+  res.status(500).json({
+    error: "Something went wrong. Please try again later.",
+    details: process.env.NODE_ENV === "development" ? err.message : undefined,
+  });
 });
+
+// === Start Server ===
+app.listen(PORT, () =>
+  console.log(`✅ Server running on http://localhost:${PORT}`)
+);
