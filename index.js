@@ -33,11 +33,22 @@ const normalize = (str) => {
     .trim();
 };
 
-// === Extract Gazette Date ===
+// === Extract Gazette Date from PDF ===
 const extractGazetteDate = (pdfText) => {
   const dateRegex = /(\d{1,2}(st|nd|rd|th)?\s+\w+\s+\d{4})/i;
   const match = pdfText.match(dateRegex);
-  return match ? match[0] : "";
+  if (match) {
+    // Convert "20th June, 2025" to "20/06/2025"
+    const [day, , monthName, year] = match[0].replace(/,/g, "").split(" ");
+    const months = {
+      january: "01", february: "02", march: "03", april: "04",
+      may: "05", june: "06", july: "07", august: "08",
+      september: "09", october: "10", november: "11", december: "12"
+    };
+    const month = months[monthName.toLowerCase()] || "01";
+    return `${day.padStart(2, "0")}/${month}/${year}`;
+  }
+  return "";
 };
 
 // === Match Route ===
@@ -65,8 +76,8 @@ app.post("/match", upload.fields([{ name: "excel" }, { name: "pdf" }]), async (r
     const workbook = xlsx.readFile(excelFile.path);
     const sheet = workbook.Sheets[workbook.SheetNames[0]];
     const excelData = xlsx.utils.sheet_to_json(sheet);
-
     const excelNames = excelData.map(row => normalize(row["Name of The Deceased"])).filter(Boolean);
+
     if (!excelNames.length) {
       cleanup();
       return res.status(400).json({ error: "Excel sheet is empty or missing name column." });
@@ -76,7 +87,6 @@ app.post("/match", upload.fields([{ name: "excel" }, { name: "pdf" }]), async (r
     const pdfBuffer = fs.readFileSync(pdfFile.path);
     const pdfText = (await pdfParse(pdfBuffer)).text;
 
-    // Gazette date
     const gazetteDate = extractGazetteDate(pdfText);
 
     // === Extract Names from PDF ===
@@ -90,6 +100,7 @@ app.post("/match", upload.fields([{ name: "excel" }, { name: "pdf" }]), async (r
     Array.from(pdfText.matchAll(fallbackRegex)).forEach(m =>
       matchesSet.add(normalize(m[1]))
     );
+
     const gazetteNames = Array.from(matchesSet);
 
     // === Matching ===
@@ -101,13 +112,15 @@ app.post("/match", upload.fields([{ name: "excel" }, { name: "pdf" }]), async (r
         limit: 1,
       })[0] || { string: "", score: 0 };
 
+      const isPublished = topMatch.score >= threshold;
+
       return {
         nameOfTheDeceased: row["Name of The Deceased"] || "",
         gazetteMatch: topMatch.string,
         score: topMatch.score,
-        gazetteDate: gazetteDate,
-        statusAtGP: topMatch.score === 100 ? "Approved" : "",
-        approvalDate: topMatch.score === 100 ? "05/06/2025" : ""
+        gazetteDate: isPublished ? gazetteDate : "",
+        statusAtGP: isPublished ? "Published" : "",
+        approvalDate: isPublished ? gazetteDate : ""
       };
     });
 
